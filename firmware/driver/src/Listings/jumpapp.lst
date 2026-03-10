@@ -1,0 +1,66 @@
+
+
+
+ARM Macro Assembler    Page 1 
+
+
+    1 00000000         ;*******************************************************
+                       ***********************
+    2 00000000         ;* File Name          : JumpApp.s
+    3 00000000         ;* Description        : Jump to application function for
+                        STM32F40xxx/41xxx
+    4 00000000         ;*                      This function jumps to the user 
+                       application at 0x08010000
+    5 00000000         ;*******************************************************
+                       ***********************
+    6 00000000         
+    7 00000000                 PRESERVE8
+    8 00000000                 THUMB
+    9 00000000         
+   10 00000000                 AREA             |.text|, CODE, READONLY
+   11 00000000         
+   12 00000000         ; JumpAPP function - Jumps to user application at 0x0801
+                       0000
+   13 00000000         JumpApp PROC
+   14 00000000                 EXPORT           JumpApp
+   15 00000000         ; Load the application start address (0x08010000)
+   16 00000000         ;               LDR     R0, =0x08010000
+   17 00000000         ; Load the stack pointer from the application's vector t
+                       able
+   18 00000000 F8D0 D000       LDR              SP, [R0, #0]
+   19 00000004         ; Load the reset handler address and jump to it
+   20 00000004 F8D0 F004       LDR              PC, [R0, #4]
+   21 00000008                 ENDP
+   22 00000008         
+   23 00000008                 ALIGN
+   24 00000008         
+   25 00000008                 END
+Command Line: --debug --xref --diag_suppress=9931 --cpu=Cortex-M4.fp --apcs=int
+erwork --depend=.\objects\jumpapp.d -o.\objects\jumpapp.o -I.\RTE\_stm32f407 -I
+D:\Keil_v5\ARM\CMSIS\Include --predefine="__MICROLIB SETA 1" --predefine="__UVI
+SION_VERSION SETA 525" --predefine="STM32F407xx SETA 1" --list=.\listings\jumpa
+pp.lst ..\app\jumpapp.s
+
+
+
+ARM Macro Assembler    Page 1 Alphabetic symbol ordering
+Relocatable symbols
+
+.text 00000000
+
+Symbol: .text
+   Definitions
+      At line 10 in file ..\app\jumpapp.s
+   Uses
+      None
+Comment: .text unused
+JumpApp 00000000
+
+Symbol: JumpApp
+   Definitions
+      At line 13 in file ..\app\jumpapp.s
+   Uses
+      At line 14 in file ..\app\jumpapp.s
+Comment: JumpApp used once
+2 symbols
+336 symbols in table
