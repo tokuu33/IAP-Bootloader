@@ -132,6 +132,16 @@ def main() -> None:
         help="Input raw application binary (.bin file from linker/objcopy)",
     )
     parser.add_argument(
+        "axf",
+        metavar="INPUT.axf",
+        nargs="?",
+        default=None,
+        help="Optional: ELF/AXF file produced by the linker (accepted but not used). "
+             "Keil MDK After-Build commands typically pass both the .bin and .axf paths; "
+             "this argument exists solely to prevent argparse from rejecting the second "
+             "positional when the .axf is appended.",
+    )
+    parser.add_argument(
         "--version",
         default="v1.0.0",
         help="Firmware version string written into magic header (default: v1.0.0)",
