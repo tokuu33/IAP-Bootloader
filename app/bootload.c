@@ -12,6 +12,8 @@
 #include "crc32.h"
 #include "ringbuffer.h"
 #include "utils.h"
+#include "fw_partition.h"
+#include "fw_manager.h"
 
 #define LOG_TAG      "bootload"
 #define LOG_LVL      ELOG_LVL_INFO
@@ -46,6 +48,10 @@
 #define ADDR_SIZE_PARAM_LENGTH 8  // uint addr + uint size
 #define ADDR_SIZE_CRC_PARAM_LENGTH 12  // uint addr + uint size + uint crc
 
+/* 新增：加密固件流式传输相关payload长度常量 */
+#define FW_WRITE_PARAM_HEADER_LEN  8     // total_size(4) + chunk_offset(4)
+#define FW_COMMIT_PARAM_LEN        16    // nonce(8) + fw_version(4) + crc32(4)
+
 typedef enum
 {
     PACKET_STATE_HEADER,
@@ -57,12 +63,15 @@ typedef enum
 
 typedef enum
 {
-    PACKET_OPCODE_INQUERY = 0x01,
-    PACKET_OPCODE_ERASE = 0x81,
-    PACKET_OPCODE_PROGRAM = 0x82,
-    PACKET_OPCODE_VERIFY = 0x83,
-    PACKET_OPCODE_RESET = 0x21,
-    PACKET_OPCODE_BOOT = 0x22
+    PACKET_OPCODE_INQUERY    = 0x01,
+    PACKET_OPCODE_ERASE      = 0x81,
+    PACKET_OPCODE_PROGRAM    = 0x82,
+    PACKET_OPCODE_VERIFY     = 0x83,
+    PACKET_OPCODE_FW_WRITE   = 0x84,  /* 向W25Q128写加密固件分片 */
+    PACKET_OPCODE_FW_COMMIT  = 0x85,  /* 提交固件：验证+激活+烧录到内部Flash+复位 */
+    PACKET_OPCODE_FW_ROLLBACK= 0x86,  /* 手动回滚到备份区 */
+    PACKET_OPCODE_RESET      = 0x21,
+    PACKET_OPCODE_BOOT       = 0x22
 } packet_opcode_t;
 
 typedef enum
@@ -73,13 +82,15 @@ typedef enum
     PACKET_ERRCODE_ERR_TIMEOUT,
     PACKET_ERRCODE_ERR_FORMAT,
     PACKET_ERRCODE_ERR_VERIFY,
+    PACKET_ERRCODE_ERR_FAILED,
     PACKET_ERRCODE_ERR_PARAM = 0xFF
 } PACKET_errcode_t;
 
 typedef enum
 {
     INQUERY_SUBCODE_VERSION = 0x00,
-    INQUERY_SUBCODE_MTU = 0x01
+    INQUERY_SUBCODE_MTU = 0x01,
+    INQUERY_SUBCODE_FW_STATUS = 0x02,/* 查询W25Q128固件版本/分区状态 */
 } inquery_subcode_t;
 
 static packet_state_machine_t packet_state = PACKET_STATE_HEADER;
@@ -122,12 +133,23 @@ static void boot_application(void)
 {
     if (!application_validate())
     {
-        log_e("Application validation failed, cannot boot.");
-        return;
+        /* 内部Flash应用无效，尝试从W25Q128备份区自动恢复 */
+        log_w("Application invalid, trying to restore from W25Q128...");
+        if (fw_manager_flash_firmware() && application_validate())
+        {
+            log_i("Firmware restored successfully from W25Q128.");
+        }
+        else
+        {
+            log_e("Application validation failed, cannot boot.");
+            return;
+        }
     }
 
     log_w("booting application ... ");
     tim_delay_ms(2);
+    /* 准备跳转前标记本次启动成功（清除失败计数和回滚标志） */
+    fw_manager_mark_boot_success();
 
     led_off(led1);
     TIM_DeInit(TIM6);
@@ -184,6 +206,23 @@ static void bl_opcode_inquery_handler(void)
             bl_response(PACKET_OPCODE_INQUERY, PACKET_ERRCODE_ERR_OK, (const uint8_t *)&mtu, sizeof(mtu));
             break;
 		}
+        case INQUERY_SUBCODE_FW_STATUS:
+        {
+            /* 返回W25Q128双区分区状态（12字节）：
+             * [active_zone(1)][zone_a_state(1)][zone_a_fw_ver(4)]
+             * [zone_b_state(1)][zone_b_fw_ver(4)][boot_fail_count(1)] */
+            const fw_meta_t *meta = fw_manager_get_meta();
+            uint8_t status[12];
+            uint8_t *p = status;
+            put_u8_inc(&p,  meta->active_zone);
+            put_u8_inc(&p,  meta->zone_a_state);
+            put_u32_inc(&p, meta->zone_a_fw_version);
+            put_u8_inc(&p,  meta->zone_b_state);
+            put_u32_inc(&p, meta->zone_b_fw_version);
+            put_u8_inc(&p,  meta->boot_fail_count);
+            bl_response(PACKET_OPCODE_INQUERY, PACKET_ERRCODE_ERR_OK, status, sizeof(status));
+            break;
+        }
         default:
 		{
             log_w("Inquary unknown subcode: %02X", subcode);
@@ -312,6 +351,145 @@ static void bl_opcode_verify_handler(void)
     bl_response(PACKET_OPCODE_VERIFY, PACKET_ERRCODE_ERR_OK, NULL, 0);
 }
 
+/**
+ * @brief 0x84 FW_WRITE — 接收加密固件分片并写入W25Q128
+ *
+ * Payload格式：[total_size(4B)][chunk_offset(4B)][encrypted_data(N)]
+ *   - total_size  : 固件总大小（每个包都携带，chunk_offset==0时触发擦区）
+ *   - chunk_offset: 本片数据在固件中的字节偏移
+ *   - N           : packet_payload_length - 8，最大4096字节
+ */
+static void bl_opcode_fw_write_handler(void)
+{
+    log_i("FW_Write handler.");
+
+    if (packet_payload_length <= FW_WRITE_PARAM_HEADER_LEN)
+    {
+        log_e("FW_Write: payload too short: %d", packet_payload_length);
+        bl_response(PACKET_OPCODE_FW_WRITE, PACKET_ERRCODE_ERR_FORMAT, NULL, 0);
+        return;
+    }
+
+    uint8_t *payload      = packet_buf + PACKET_PAYLOAD_OFFSET;
+    uint32_t total_size   = get_u32_inc(&payload);  /* 固件总大小 */
+    uint32_t chunk_offset = get_u32_inc(&payload);  /* 本片在固件中的偏移 */
+    uint8_t *data         = payload;                /* 加密数据起始指针 */
+    uint16_t data_size    = (uint16_t)(packet_payload_length - FW_WRITE_PARAM_HEADER_LEN);
+
+    /* 第一片（offset==0）：选区+擦除 */
+    if (chunk_offset == 0)
+    {
+        log_i("FW_Write: begin_write, total_size=%lu", (unsigned long)total_size);
+        if (!fw_manager_begin_write(total_size))
+        {
+            log_e("FW_Write: begin_write failed");
+            bl_response(PACKET_OPCODE_FW_WRITE, PACKET_ERRCODE_ERR_FAILED, NULL, 0);
+            return;
+        }
+    }
+
+    /* 写入本片数据 */
+    if (!fw_manager_write_chunk(chunk_offset, data, data_size))
+    {
+        log_e("FW_Write: write_chunk failed at offset 0x%08lX", (unsigned long)chunk_offset);
+        bl_response(PACKET_OPCODE_FW_WRITE, PACKET_ERRCODE_ERR_FAILED, NULL, 0);
+        return;
+    }
+
+    log_d("FW_Write: chunk offset=0x%08lX size=%u OK", (unsigned long)chunk_offset, data_size);
+    bl_response(PACKET_OPCODE_FW_WRITE, PACKET_ERRCODE_ERR_OK, NULL, 0);
+}
+
+/**
+ * @brief 0x85 FW_COMMIT — 提交固件：解密验证CRC32 → 更新元数据 → 烧录到内部Flash → 复位
+ *
+ * Payload格式：[nonce(8B)][fw_version(4B)][crc32(4B)] = 16字节
+ * 流程：先完成验证+元数据更新，验证通过后发送ACK，再执行烧录并复位。
+ * 上位机收到ACK后等待设备重连即可；若收到ERR_VERIFY则说明固件CRC校验失败。
+ */
+static void bl_opcode_fw_commit_handler(void)
+{
+    log_i("FW_Commit handler.");
+
+    if (packet_payload_length != FW_COMMIT_PARAM_LEN)
+    {
+        log_e("FW_Commit: payload length error: %d (expected %d)",
+              packet_payload_length, FW_COMMIT_PARAM_LEN);
+        bl_response(PACKET_OPCODE_FW_COMMIT, PACKET_ERRCODE_ERR_FORMAT, NULL, 0);
+        return;
+    }
+
+    /* 使用增量指针解析payload，避免魔法数字偏移 */
+    const uint8_t *p = packet_buf + PACKET_PAYLOAD_OFFSET;
+    uint8_t nonce[8];
+    get_bytes_inc(&p, nonce, 8);                    /* nonce: 8字节 */
+    uint32_t fw_version = get_u32_inc((uint8_t **)&p); /* fw_version: 4字节 */
+    uint32_t crc32_val  = get_u32_inc((uint8_t **)&p); /* crc32: 4字节 */
+
+    log_i("FW_Commit: fw_version=%lu, crc32=0x%08lX",
+          (unsigned long)fw_version, (unsigned long)crc32_val);
+
+    /* 先执行验证+元数据更新（可能需要数秒完成CRC解密校验）：
+     * commit_write 返回 false 表示验证失败，此时发送错误响应并返回。
+     * commit_write 返回 true 表示验证和元数据更新成功，可以进入烧录阶段。 */
+    if (!fw_manager_commit_write(nonce, fw_version, crc32_val))
+    {
+        log_e("FW_Commit: CRC32 verify failed");
+        bl_response(PACKET_OPCODE_FW_COMMIT, PACKET_ERRCODE_ERR_VERIFY, NULL, 0);
+        return;
+    }
+
+    /* 验证通过，发送ACK（上位机收到OK后等待设备重连） */
+    bl_response(PACKET_OPCODE_FW_COMMIT, PACKET_ERRCODE_ERR_OK, NULL, 0);
+    tim_delay_ms(5); /* 确保ACK帧发送完成 */
+
+    /* 解密烧录到内部Flash，烧录成功后复位系统 */
+    log_i("FW_Commit: flashing firmware...");
+    fw_manager_flash_firmware();
+    NVIC_SystemReset();
+}
+
+/**
+ * @brief 0x86 FW_ROLLBACK — 手动请求回滚到备份区
+ *
+ * Payload：空（长度为0）
+ * 调用成功后系统将复位并从备份区固件启动。
+ */
+static void bl_opcode_fw_rollback_handler(void)
+{
+    log_i("FW_Rollback handler.");
+
+    if (packet_payload_length != 0)
+    {
+        log_e("FW_Rollback: payload length error: %d", packet_payload_length);
+        bl_response(PACKET_OPCODE_FW_ROLLBACK, PACKET_ERRCODE_ERR_FORMAT, NULL, 0);
+        return;
+    }
+
+    const fw_meta_t *meta = fw_manager_get_meta();
+    uint8_t backup_zone  = (meta->active_zone == 0U) ? 1U : 0U;
+    uint8_t backup_state = (backup_zone == 0U) ? meta->zone_a_state : meta->zone_b_state;
+
+    if (backup_state != (uint8_t)ZONE_STATE_VALID)
+    {
+        bl_response(PACKET_OPCODE_FW_ROLLBACK, PACKET_ERRCODE_ERR_FAILED, NULL, 0);  // 明确告知失败
+        return; // 不触发复位
+    }
+
+    bl_response(PACKET_OPCODE_FW_ROLLBACK, PACKET_ERRCODE_ERR_OK, NULL, 0);
+    tim_delay_ms(5);
+
+    log_w("FW_Rollback: requesting rollback to backup zone...");
+    /* 设置回滚标志，然后立即执行回滚（切换激活区 → 烧录 → 复位） */
+    fw_manager_request_rollback();
+    fw_manager_check_rollback();
+
+    /* check_rollback 若执行回滚会调用 NVIC_SystemReset()，不会返回此处 */
+    /* 若无可用备份区，check_rollback 会直接返回，此时发送失败响应 */
+    log_e("FW_Rollback: no valid backup zone available");
+    NVIC_SystemReset();
+}
+
 static void bl_opcode_reset_handler(void)
 {
     log_i("Reset handler.");
@@ -344,6 +522,15 @@ static void bl_packet_handler(void)
             break;
         case PACKET_OPCODE_VERIFY:
              bl_opcode_verify_handler();
+            break;
+        case PACKET_OPCODE_FW_WRITE:
+             bl_opcode_fw_write_handler();
+            break;
+        case PACKET_OPCODE_FW_COMMIT:
+             bl_opcode_fw_commit_handler();
+            break;
+        case PACKET_OPCODE_FW_ROLLBACK:
+             bl_opcode_fw_rollback_handler();
             break;
         case PACKET_OPCODE_RESET:
              bl_opcode_reset_handler();
@@ -397,6 +584,9 @@ static bool bl_byte_handler(uint8_t byte)
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_ERASE ||
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_PROGRAM ||
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_VERIFY ||
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_FW_WRITE ||
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_FW_COMMIT ||
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_FW_ROLLBACK ||
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_RESET ||
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_BOOT)
                 {
@@ -514,19 +704,36 @@ static bool key_press_check(void)
 
 bool magic_header_trap_boot(void)
 {
-    if (!magic_header_validate())
+    /* 应用有效，直接启动（无需进入Bootloader模式） */
+    if (magic_header_validate() && application_validate())
+        return false;
+
+    /* 内部Flash应用无效，尝试从W25Q128备份区自动恢复 */
+    log_w("Application invalid, attempting auto-restore from W25Q128 backup...");
+    const fw_meta_t *meta = fw_manager_get_meta();
+    bool has_backup = (meta->zone_a_state == (uint8_t)ZONE_STATE_VALID) ||
+                      (meta->zone_b_state == (uint8_t)ZONE_STATE_VALID);
+
+    if (has_backup)
     {
-        log_w("Magic header invalid, entering bootloader mode.");
-        return true;
+        log_i("Restoring firmware from W25Q128...");
+        if (fw_manager_flash_firmware())
+        {
+            if (magic_header_validate() && application_validate())
+            {
+                log_i("Auto-restore successful, booting application.");
+                return false;  /* 恢复成功，正常启动，不进入Bootloader模式 */
+            }
+        }
+        log_e("Auto-restore failed, entering bootloader mode.");
     }
 
-    if (!application_validate())
+    else
     {
-        log_w("Application invalid, entering bootloader mode.");
-        return true;
+        log_w("No valid backup in W25Q128, entering bootloader mode.");
     }
 
-    return false;
+    return true;
 }
 
 bool rx_trap_boot(void)
