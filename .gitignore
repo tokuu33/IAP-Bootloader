@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+*.suo
+*.user
+.vs/
