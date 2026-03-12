@@ -284,6 +284,10 @@ static bool decrypt_and_flash(uint32_t zone_addr, uint32_t size,
 
 void fw_manager_init(void)
 {
+    /* 幂等性保护：已初始化则直接返回，防止重复调用导致元数据重新读取 */
+    if (s_meta_valid)
+        return;
+
     /* 使能SPI1时钟（board_lowlevel_init中未启用SPI1 APB2时钟，在此补充初始化）
      * 注：不修改board.c/w25q128.c的前提下，须在调用w25qxx_init前使能时钟 */
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_SPI1, ENABLE);
@@ -781,7 +785,7 @@ bool fw_manager_commit_write(const uint8_t nonce[8], uint32_t fw_version, uint32
     s_write_zone_idx   = 0;
     s_write_total_size = 0;
 
-    log_i("fw_commit: metadata updated, zone_%c active. Caller should flash+reset.",
+    log_i("fw_commit: metadata updated, zone_%c active. Flashing and reset handled by caller.",
           (s_meta.active_zone == 0) ? 'A' : 'B');
 
     return true; /* 验证和元数据更新成功；调用者负责执行烧录和复位 */
