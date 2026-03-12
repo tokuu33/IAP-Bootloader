@@ -85,7 +85,7 @@ public sealed class Transfer : IDisposable
     private const int ADDR_SIZE_CRC_PARAM_LEN= 12;  // uint addr(4) + uint size(4) + uint crc(4)
     private const int FW_WRITE_HEADER_LEN    = 8;   // total_size(4) + chunk_offset(4)
     private const int FW_COMMIT_PARAM_LEN    = 16;  // nonce(8) + fw_version(4) + crc32(4)
-    private const int FW_STATUS_RESPONSE_LEN = 12;  // see INQUERY_SUBCODE_FW_STATUS handler
+    private const int FW_STATUS_RESPONSE_LEN = 12;  // see INQUIRY_SUBCODE_FW_STATUS handler
 
     // ── Enumerations ──────────────────────────────────────────────────────────
 
