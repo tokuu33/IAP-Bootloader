@@ -197,6 +197,8 @@ namespace SerialUpgrader
             if (header == null)
             {
                 Log("错误：无效的固件文件（Magic Header 校验失败）。");
+                Log("提示：请使用 gen_xbin.py 重新打包固件（旧格式 .xbin 与当前版本不兼容）。");
+                Log("      示例：python tools/gen_xbin.py app.bin --version v1.0.0");
                 SetButtonsEnabled(true);
                 return;
             }

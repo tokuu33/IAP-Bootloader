@@ -137,9 +137,10 @@ def main() -> None:
         nargs="?",
         default=None,
         help="Optional: ELF/AXF file produced by the linker (accepted but not used). "
-             "Keil MDK After-Build commands typically pass both the .bin and .axf paths; "
-             "this argument exists solely to prevent argparse from rejecting the second "
-             "positional when the .axf is appended.",
+             "Keil MDK After-Build commands always pass both the .bin and .axf paths; "
+             "this argument exists permanently to prevent argparse from rejecting the "
+             "second positional. The .axf is not needed for .xbin generation because "
+             "all required information is derived from the raw binary.",
     )
     parser.add_argument(
         "--version",
