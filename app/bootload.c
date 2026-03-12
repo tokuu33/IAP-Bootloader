@@ -47,9 +47,25 @@
 #define ADDR_SIZE_PARAM_LENGTH 8         // uint addr + uint size
 #define ADDR_SIZE_CRC_PARAM_LENGTH 12    // uint addr + uint size + uint crc
 
-/* 新增：加密固件流式传输相关payload长度常量 */
-#define FW_WRITE_PARAM_HEADER_LEN  8     // total_size(4) + chunk_offset(4)
-#define FW_COMMIT_PARAM_LEN        16    // nonce(8) + fw_version(4) + crc32(4)
+/*
+ * 加密固件流式传输相关 payload 长度常量
+ *
+ * FW_WRITE_PARAM_HEADER_LEN (8)
+ *   用途：FW_WRITE 指令 (0x84) payload 中固定元数据头部的字节长度。
+ *   FW_WRITE payload 格式：
+ *     [total_size (4B, uint32)] [chunk_offset (4B, uint32)] [encrypted_data (N B)]
+ *   头部固定占 8 字节，紧跟其后的才是本片加密数据。
+ *   处理函数用法：
+ *     data_size = packet_payload_length - FW_WRITE_PARAM_HEADER_LEN  // 本片加密数据长度
+ *
+ * FW_COMMIT_PARAM_LEN (16)
+ *   用途：FW_COMMIT 指令 (0x85) payload 的精确总字节长度（固定长度，不可多也不可少）。
+ *   FW_COMMIT payload 格式：
+ *     [nonce (8B)] [fw_version (4B, uint32)] [crc32 (4B, uint32)]
+ *   处理函数用 packet_payload_length == FW_COMMIT_PARAM_LEN 做格式校验。
+ */
+#define FW_WRITE_PARAM_HEADER_LEN  8    /* FW_WRITE(0x84)  payload头部：total_size(4B) + chunk_offset(4B) */
+#define FW_COMMIT_PARAM_LEN        16   /* FW_COMMIT(0x85) payload总长：nonce(8B) + fw_version(4B) + crc32(4B) */
 
 typedef enum
 {
