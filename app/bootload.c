@@ -43,9 +43,9 @@
 #define PACKET_PAYLOAD_OFFSET 4
 #define PACKET_MIN_SIZE (PACKET_HEADER_SIZE + PACKET_OPCODE_SIZE + PACKET_LENGTH_SIZE + PACKET_CRC_SIZE)
 
-// �������ȳ���
-#define ADDR_SIZE_PARAM_LENGTH 8         // uint addr + uint size
-#define ADDR_SIZE_CRC_PARAM_LENGTH 12    // uint addr + uint size + uint crc
+// 指令参数长度常量
+#define ADDR_SIZE_PARAM_LENGTH 8         // uint32_t addr + uint32_t size
+#define ADDR_SIZE_CRC_PARAM_LENGTH 12    // uint32_t addr + uint32_t size + uint32_t crc
 
 /*
  * 加密固件流式传输相关 payload 长度常量
