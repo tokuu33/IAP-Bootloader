@@ -3,6 +3,8 @@
 #include "usart.h"
 #include "tim_delay.h"
 #include "elog.h"
+#include "fw_crypto.h"
+#include "fw_manager.h"
 
 extern void board_lowlevel_init(void);
 extern void bootloader_main(void);
@@ -23,6 +25,13 @@ int main(void)
     elog_set_fmt(ELOG_LVL_VERBOSE, ELOG_FMT_TAG);
     elog_start();
 #endif
+
+    /* 初始化固件加密模块（加载默认AES-128密钥，生成轮密钥） */
+    fw_crypto_init();
+    /* 初始化固件管理器（初始化W25Q128、读取元数据） */
+    fw_manager_init();
+    /* 检查是否需要回滚（rollback_flag或boot_fail_count超限则切换到备份区） */
+    fw_manager_check_rollback();
 
     bootloader_main();
 
