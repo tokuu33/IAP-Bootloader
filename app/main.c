@@ -2,6 +2,7 @@
 #include "stm32f4xx.h"
 #include "usart.h"
 #include "tim_delay.h"
+#include "w25q128.h"
 #include "elog.h"
 
 extern void board_lowlevel_init(void);
@@ -12,6 +13,7 @@ int main(void)
     board_lowlevel_init();
 	usart_init();
 	tim_delay_init();
+    w25qxx_init();
 
 #ifdef ELOG_OUTPUT_ENABLE
     elog_init();
