@@ -12,6 +12,8 @@
 #include "crc32.h"
 #include "ringbuffer.h"
 #include "utils.h"
+#include "fw_crypto.h"
+#include "backup_mgr.h"
 
 #define LOG_TAG      "bootload"
 #define LOG_LVL      ELOG_LVL_INFO
@@ -23,7 +25,8 @@
 #define APP_BASE_ADDRESS 0x08010000
 #define RX_TIMEOUT_MS    20
 #define RX_BUFFER_SIZE   (5 * 1024)
-#define PAYLOAD_SIZE_MAX (4096 + 8) //4096为Program数据最大长度，8为Program指令的地址(4)和大小(4)字段长度
+/* Max payload: 4096 bytes data + 8 bytes addr/size + 16 bytes AES IV. */
+#define PAYLOAD_SIZE_MAX (4096 + 8 + FW_CRYPTO_IV_SIZE)
 #define PACKET_SIZE_MAX  (4 + PAYLOAD_SIZE_MAX + 2)  // header(1) + opcode(1) + length(2) + payload + crc16(2)
 #define BOOT_DELAY       3000
 
@@ -62,7 +65,11 @@ typedef enum
     PACKET_OPCODE_PROGRAM = 0x82,
     PACKET_OPCODE_VERIFY = 0x83,
     PACKET_OPCODE_RESET = 0x21,
-    PACKET_OPCODE_BOOT = 0x22
+    PACKET_OPCODE_BOOT = 0x22,
+    PACKET_OPCODE_ROLLBACK    = 0x23,  /* Roll back to previous backup            */
+    PACKET_OPCODE_BACKUP      = 0x24,  /* Backup current firmware to W25Q128      */
+    PACKET_OPCODE_CRYPTO_INIT = 0x84,  /* Initialise AES-CBC context with IV      */
+    PACKET_OPCODE_PROGRAM_ENC = 0x85   /* Program encrypted firmware chunk        */
 } packet_opcode_t;
 
 typedef enum
@@ -325,8 +332,165 @@ static void bl_opcode_reset_handler(void)
 static void bl_opcode_boot_handler(void)
 {
     log_i("Boot handler.");
+
+    /* Auto-backup the current firmware before jumping to the application.
+     * Zone 0 holds the latest backup; the old zone 0 content is first
+     * rotated into zone 1 to preserve one-step rollback capability. */
+    if (magic_header_validate())
+    {
+        log_i("Auto-backing up firmware before boot");
+        backup_mgr_rotate_and_save(
+            magic_header_get_address(),
+            magic_header_get_length(),
+            magic_header_get_crc32(),
+            magic_header_get_version());
+    }
+
     bl_response(PACKET_OPCODE_BOOT, PACKET_ERRCODE_ERR_OK, NULL, 0);
     boot_application();
+}
+
+/* -----------------------------------------------------------------------
+ * CRYPTO_INIT handler (opcode 0x84)
+ * Payload: iv[16]
+ * ----------------------------------------------------------------------- */
+static void bl_opcode_crypto_init_handler(void)
+{
+    log_i("Crypto-init handler.");
+
+    if (packet_payload_length != FW_CRYPTO_IV_SIZE)
+    {
+        log_e("Crypto-init payload length error: %d (expected %d)",
+              packet_payload_length, FW_CRYPTO_IV_SIZE);
+        bl_response(PACKET_OPCODE_CRYPTO_INIT, PACKET_ERRCODE_ERR_FORMAT, NULL, 0);
+        return;
+    }
+
+    const uint8_t *iv = packet_buf + PACKET_PAYLOAD_OFFSET;
+    fw_crypto_init(iv);
+
+    log_i("AES-128-CBC context initialised");
+    bl_response(PACKET_OPCODE_CRYPTO_INIT, PACKET_ERRCODE_ERR_OK, NULL, 0);
+}
+
+/* -----------------------------------------------------------------------
+ * PROGRAM_ENC handler (opcode 0x85)
+ * Payload: addr[4] + size[4] + encrypted_data[size]
+ * The caller must send CRYPTO_INIT (0x84) before the first PROGRAM_ENC.
+ * Consecutive PROGRAM_ENC calls share the same running AES-CBC context
+ * so the host must transmit chunks in order and without gaps.
+ * ----------------------------------------------------------------------- */
+static void bl_opcode_program_enc_handler(void)
+{
+    log_i("Program-enc handler.");
+
+    if (!fw_crypto_is_active())
+    {
+        log_e("AES context not initialised (send CRYPTO_INIT first)");
+        bl_response(PACKET_OPCODE_PROGRAM_ENC, PACKET_ERRCODE_ERR_PARAM, NULL, 0);
+        return;
+    }
+
+    if (packet_payload_length <= ADDR_SIZE_PARAM_LENGTH)
+    {
+        log_e("Program-enc packet length error: %d", packet_payload_length);
+        bl_response(PACKET_OPCODE_PROGRAM_ENC, PACKET_ERRCODE_ERR_FORMAT, NULL, 0);
+        return;
+    }
+
+    uint8_t *payload = packet_buf + PACKET_PAYLOAD_OFFSET;
+    uint32_t address = get_u32_inc(&payload);
+    uint32_t size    = get_u32_inc(&payload);
+    uint8_t *data    = payload;
+
+    if (address < STM32_FLASH_BASE ||
+        address + size > STM32_FLASH_BASE + STM32_FLASH_SIZE)
+    {
+        log_e("Program-enc address 0x%08X size %u out of range", address, size);
+        bl_response(PACKET_OPCODE_PROGRAM_ENC, PACKET_ERRCODE_ERR_PARAM, NULL, 0);
+        return;
+    }
+
+    if (address >= BL_ADDRESS && address < BL_ADDRESS + BL_SIZE)
+    {
+        log_e("Address 0x%08X is in protected bootloader region", address);
+        bl_response(PACKET_OPCODE_PROGRAM_ENC, PACKET_ERRCODE_ERR_PARAM, NULL, 0);
+        return;
+    }
+
+    if (size != packet_payload_length - ADDR_SIZE_PARAM_LENGTH)
+    {
+        log_e("Program-enc size mismatch: size=%u payload_data=%u",
+              size, packet_payload_length - ADDR_SIZE_PARAM_LENGTH);
+        bl_response(PACKET_OPCODE_PROGRAM_ENC, PACKET_ERRCODE_ERR_FORMAT, NULL, 0);
+        return;
+    }
+
+    /* AES-CBC requires size to be a multiple of the block length. */
+    if (size % AES_BLOCKLEN != 0)
+    {
+        log_e("Program-enc size %u is not a multiple of AES block size (%d)",
+              size, AES_BLOCKLEN);
+        bl_response(PACKET_OPCODE_PROGRAM_ENC, PACKET_ERRCODE_ERR_FORMAT, NULL, 0);
+        return;
+    }
+
+    log_i("Program-enc address: 0x%08X, size: %u", address, size);
+
+    /* Decrypt in-place before writing to flash. */
+    fw_crypto_decrypt(data, size);
+
+    stm32_flash_unlock();
+    stm32_flash_program(address, data, size);
+    stm32_flash_lock();
+
+    bl_response(PACKET_OPCODE_PROGRAM_ENC, PACKET_ERRCODE_ERR_OK, NULL, 0);
+}
+
+/* -----------------------------------------------------------------------
+ * ROLLBACK handler (opcode 0x23)
+ * No payload.  Restores the best valid backup from W25Q128 and rebuilds
+ * the internal magic header.
+ * ----------------------------------------------------------------------- */
+static void bl_opcode_rollback_handler(void)
+{
+    log_i("Rollback handler.");
+
+    if (backup_mgr_rollback())
+    {
+        log_i("Rollback succeeded");
+        bl_response(PACKET_OPCODE_ROLLBACK, PACKET_ERRCODE_ERR_OK, NULL, 0);
+    }
+    else
+    {
+        log_e("Rollback failed: no valid backup zone");
+        bl_response(PACKET_OPCODE_ROLLBACK, PACKET_ERRCODE_ERR_VERIFY, NULL, 0);
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * BACKUP handler (opcode 0x24)
+ * No payload.  Explicitly backs up the current firmware to W25Q128.
+ * ----------------------------------------------------------------------- */
+static void bl_opcode_backup_handler(void)
+{
+    log_i("Backup handler.");
+
+    if (!magic_header_validate())
+    {
+        log_e("Magic header invalid, cannot backup");
+        bl_response(PACKET_OPCODE_BACKUP, PACKET_ERRCODE_ERR_VERIFY, NULL, 0);
+        return;
+    }
+
+    backup_mgr_rotate_and_save(
+        magic_header_get_address(),
+        magic_header_get_length(),
+        magic_header_get_crc32(),
+        magic_header_get_version());
+
+    log_i("Firmware backed up successfully");
+    bl_response(PACKET_OPCODE_BACKUP, PACKET_ERRCODE_ERR_OK, NULL, 0);
 }
 
 static void bl_packet_handler(void)
@@ -350,6 +514,18 @@ static void bl_packet_handler(void)
             break;
         case PACKET_OPCODE_BOOT:
              bl_opcode_boot_handler();
+            break;
+        case PACKET_OPCODE_ROLLBACK:
+            bl_opcode_rollback_handler();
+            break;
+        case PACKET_OPCODE_BACKUP:
+            bl_opcode_backup_handler();
+            break;
+        case PACKET_OPCODE_CRYPTO_INIT:
+            bl_opcode_crypto_init_handler();
+            break;
+        case PACKET_OPCODE_PROGRAM_ENC:
+            bl_opcode_program_enc_handler();
             break;
         default:
             log_w("Unknown opcode: %02X", packet_opcode);
@@ -398,7 +574,11 @@ static bool bl_byte_handler(uint8_t byte)
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_PROGRAM ||
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_VERIFY ||
                     packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_RESET ||
-                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_BOOT)
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_BOOT ||
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_ROLLBACK ||
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_BACKUP ||
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_CRYPTO_INIT ||
+                    packet_buf[PACKET_OPCODE_OFFSET] == PACKET_OPCODE_PROGRAM_ENC)
                 {
 					log_d("opcode ok: %02X", packet_buf[PACKET_OPCODE_OFFSET]);
                     packet_opcode = (packet_opcode_t)packet_buf[PACKET_OPCODE_OFFSET];
@@ -554,11 +734,33 @@ void bootloader_main(void)
     bl_usart_init();
     bl_usart_register_rx_callback(bl_rx_handler);
 
+    /* Initialise the W25Q128 backup manager early so that auto-rollback
+     * is available before the boot traps are evaluated. */
+    backup_mgr_init();
 
     bool trap_boot = false;
 
     if (!trap_boot)
         trap_boot = magic_header_trap_boot();
+
+    /* Auto-rollback: if the application is invalid, attempt to restore
+     * the most recent valid backup from W25Q128 before entering
+     * bootloader mode. */
+    if (trap_boot)
+    {
+        log_w("Application invalid, attempting auto-rollback from W25Q128 backup...");
+        if (backup_mgr_rollback())
+        {
+            log_i("Auto-rollback succeeded, booting restored firmware");
+            boot_application();
+            /* boot_application() only returns on failure. */
+            log_e("Boot after rollback failed, entering bootloader mode");
+        }
+        else
+        {
+            log_w("Auto-rollback failed (no valid backup), entering bootloader mode");
+        }
+    }
 
     if (!trap_boot)
         trap_boot = key_trap_check();
