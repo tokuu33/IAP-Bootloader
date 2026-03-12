@@ -43,6 +43,9 @@
 /* 启动失败触发回滚的阈值 */
 #define BOOT_FAIL_THRESHOLD  3
 
+/* AES CTR 模式：size字节数据消耗的AES块数（不足16字节的尾块算1块） */
+#define AES_BLOCKS_FOR_SIZE(size)  (((size) / 16U) + (((size) % 16U) ? 1U : 0U))
+
 /* ========================================================================== */
 /* 模块状态                                                                     */
 /* ========================================================================== */
@@ -58,6 +61,17 @@ static uint8_t s_chunk_buf[CHUNK_SIZE];
 
 /* 解密后的明文缓冲区（与s_chunk_buf等大） */
 static uint8_t s_plain_buf[CHUNK_SIZE];
+
+/* ========================================================================== */
+/* 分片流式写入状态（由 begin_write / write_chunk / commit_write 共享）          */
+/* ========================================================================== */
+
+/* 当前写入目标区的起始地址（0 = 未开始） */
+static uint32_t s_write_zone_addr = 0;
+/* 当前写入目标区编号：0=ZONE_A，1=ZONE_B */
+static uint8_t  s_write_zone_idx  = 0;
+/* 本次固件的完整大小（由 begin_write 设置，commit_write 使用） */
+static uint32_t s_write_total_size = 0;
 
 /* ========================================================================== */
 /* CRC32 内部辅助（与fw_crypto使用相同算法，多项式0xEDB88320） */
@@ -207,8 +221,8 @@ static bool verify_zone(uint32_t zone_addr, uint32_t size,
         }
 
         offset  += chunk_len;
-        /* 每16字节(一个AES块)消耗一个counter值，不足16字节的尾块同样消耗一个 */
-        counter += (chunk_len / 16U) + ((chunk_len % 16U) ? 1U : 0U);
+        /* 每个AES块（含不足16字节的尾块）消耗一个counter值 */
+        counter += AES_BLOCKS_FOR_SIZE(chunk_len);
     }
 
     crc_accum ^= 0xFFFFFFFFUL;
@@ -251,8 +265,8 @@ static bool decrypt_and_flash(uint32_t zone_addr, uint32_t size,
         }
 
         offset    += chunk_len;
-        /* 每16字节消耗一个counter值，尾块不足16字节时同样占用一个counter（与fw_crypto_decrypt行为一致） */
-        counter   += (chunk_len / 16U) + ((chunk_len % 16U) ? 1U : 0U);
+        /* 每个AES块（含不足16字节的尾块）消耗一个counter值 */
+        counter   += AES_BLOCKS_FOR_SIZE(chunk_len);
     }
 
     return true;
@@ -637,4 +651,132 @@ void fw_manager_print_status(void)
           (unsigned long)s_meta.zone_b_fw_version,
           (unsigned long)s_meta.zone_b_size);
     log_i("=========================");
+}
+
+/* ========================================================================== */
+/* 分片流式写入接口实现                                                          */
+/* ========================================================================== */
+
+bool fw_manager_begin_write(uint32_t total_size)
+{
+    uint32_t target_addr;
+    uint8_t  target_zone;
+    uint32_t erase_size;
+
+    if (total_size == 0 || total_size > FW_ZONE_A_SIZE)
+    {
+        log_e("fw_begin: invalid total_size %lu", (unsigned long)total_size);
+        return false;
+    }
+
+    /* 确定目标区（同 fw_manager_write_firmware 的选区逻辑）：
+     * 若 ZONE_A 无效（首次写入），写入 ZONE_A；
+     * 否则写入非激活区（active_zone=0→写B，active_zone=1→写A）。*/
+    if (s_meta.zone_a_state != (uint8_t)ZONE_STATE_VALID)
+    {
+        target_zone = 0;
+        target_addr = FW_ZONE_A_ADDR;
+    }
+    else
+    {
+        target_zone = (s_meta.active_zone == 0) ? 1U : 0U;
+        target_addr = (target_zone == 0) ? FW_ZONE_A_ADDR : FW_ZONE_B_ADDR;
+    }
+
+    log_i("fw_begin: target zone_%c addr=0x%06lX, erase for %lu bytes",
+          (target_zone == 0) ? 'A' : 'B',
+          (unsigned long)target_addr,
+          (unsigned long)total_size);
+
+    /* 按4KB对齐向上取整擦除目标区 */
+    erase_size = ((total_size + W25Q_SECTOR_SIZE - 1U) / W25Q_SECTOR_SIZE) * W25Q_SECTOR_SIZE;
+    erase_zone(target_addr, erase_size);
+
+    /* 记录流式写入状态 */
+    s_write_zone_addr  = target_addr;
+    s_write_zone_idx   = target_zone;
+    s_write_total_size = total_size;
+
+    return true;
+}
+
+bool fw_manager_write_chunk(uint32_t offset, const uint8_t *data, uint32_t size)
+{
+    if (s_write_zone_addr == 0)
+    {
+        log_e("fw_chunk: begin_write not called");
+        return false;
+    }
+    if (offset + size > FW_ZONE_A_SIZE)
+    {
+        log_e("fw_chunk: offset+size overflow zone");
+        return false;
+    }
+
+    w25qxx_write(s_write_zone_addr + offset, (uint8_t *)data, size);
+    log_d("fw_chunk: wrote %lu bytes at zone offset 0x%08lX",
+          (unsigned long)size, (unsigned long)offset);
+    return true;
+}
+
+bool fw_manager_commit_write(const uint8_t nonce[8], uint32_t fw_version, uint32_t crc32)
+{
+    if (s_write_zone_addr == 0)
+    {
+        log_e("fw_commit: begin_write not called");
+        return false;
+    }
+    if (s_write_total_size == 0)
+    {
+        log_e("fw_commit: total_size is zero");
+        return false;
+    }
+
+    log_i("fw_commit: verifying zone_%c, size=%lu",
+          (s_write_zone_idx == 0) ? 'A' : 'B',
+          (unsigned long)s_write_total_size);
+
+    /* 解密验证CRC32（从W25Q128读出加密数据，解密后计算CRC32并与预期比对） */
+    if (!verify_zone(s_write_zone_addr, s_write_total_size, crc32, nonce))
+    {
+        log_e("fw_commit: CRC32 verify failed");
+        return false;
+    }
+
+    /* 更新目标区元数据 */
+    if (s_write_zone_idx == 0)
+    {
+        s_meta.zone_a_fw_version = fw_version;
+        s_meta.zone_a_size       = s_write_total_size;
+        s_meta.zone_a_crc32      = crc32;
+        memcpy(s_meta.zone_a_nonce, nonce, 8);
+        s_meta.zone_a_state      = (uint8_t)ZONE_STATE_VALID;
+    }
+    else
+    {
+        s_meta.zone_b_fw_version = fw_version;
+        s_meta.zone_b_size       = s_write_total_size;
+        s_meta.zone_b_crc32      = crc32;
+        memcpy(s_meta.zone_b_nonce, nonce, 8);
+        s_meta.zone_b_state      = (uint8_t)ZONE_STATE_VALID;
+    }
+
+    /* 将新写入的区域设为激活区（立即生效，旧区域变为备份） */
+    s_meta.active_zone     = s_write_zone_idx;
+    s_meta.rollback_flag   = 0;
+    s_meta.boot_fail_count = 0;
+    meta_write(&s_meta);
+
+    log_i("fw_commit: metadata updated, zone_%c is now active",
+          (s_write_zone_idx == 0) ? 'A' : 'B');
+
+    /* 清除流式写入状态（防止重复提交） */
+    s_write_zone_addr  = 0;
+    s_write_zone_idx   = 0;
+    s_write_total_size = 0;
+
+    log_i("fw_commit: metadata updated, zone_%c active. Caller should flash+reset.",
+          (s_meta.active_zone == 0) ? 'A' : 'B');
+
+    return true; /* 验证和元数据更新成功；调用者负责执行烧录和复位 */
 }

@@ -60,4 +60,36 @@ const fw_meta_t *fw_manager_get_meta(void);
  */
 void fw_manager_print_status(void);
 
+/* ========================================================================== */
+/* 分片流式写入接口（供bootloader UART协议层调用）                               */
+/* ========================================================================== */
+
+/**
+ * @brief 开始接收新固件：自动选择目标区（非激活区），按需擦除
+ * @param total_size 本次固件完整大小（字节），用于计算需擦除的扇区数
+ * @return true=成功（目标区已选定并擦除）
+ */
+bool fw_manager_begin_write(uint32_t total_size);
+
+/**
+ * @brief 将一片加密固件数据写入W25Q128目标区
+ *        必须在 fw_manager_begin_write() 之后调用
+ * @param offset 本片数据在固件中的字节偏移（从0开始）
+ * @param data   加密数据缓冲区
+ * @param size   本片数据字节数
+ * @return true=成功
+ */
+bool fw_manager_write_chunk(uint32_t offset, const uint8_t *data, uint32_t size);
+
+/**
+ * @brief 提交固件写入：解密验证CRC32 → 更新元数据 → 解密烧录到内部Flash → 系统复位
+ *        全部成功后调用 NVIC_SystemReset()，调用者在收到响应后系统会重启。
+ *        必须在所有 fw_manager_write_chunk() 调用完毕后调用。
+ * @param nonce      AES-128 CTR nonce（8字节）
+ * @param fw_version 固件版本号
+ * @param crc32      明文固件CRC32（由上位机提供，用于解密后校验）
+ * @return true=写入成功（实际会触发系统复位，不会返回）；false=失败
+ */
+bool fw_manager_commit_write(const uint8_t nonce[8], uint32_t fw_version, uint32_t crc32);
+
 #endif /* __FW_MANAGER_H__ */
