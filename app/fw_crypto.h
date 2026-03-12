@@ -19,8 +19,11 @@ void fw_crypto_set_key(const uint8_t *key);
  * @param in       输入数据（密文）
  * @param out      输出数据（明文）
  * @param len      数据长度（字节，不需要是16的倍数）
- * @param nonce    8字节nonce
- * @param counter  起始计数器值
+ * @param nonce    8字节 nonce（Number Used Once）：AES-128 CTR 计数器块的前 8 字节 IV。
+ *                 上位机加密时随机生成，由 FW_COMMIT 指令 payload 传入，用于还原与加密时
+ *                 完全一致的计数器块序列，从而正确解密固件。
+ *                 计数器块格式：[nonce(8B)][counter_be(4B)][zeros(4B)]
+ * @param counter  起始计数器值（通常为 0，每处理 16 字节递增 1）
  */
 void fw_crypto_decrypt(const uint8_t *in, uint8_t *out, uint32_t len,
                        const uint8_t nonce[8], uint32_t counter);

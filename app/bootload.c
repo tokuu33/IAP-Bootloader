@@ -43,9 +43,9 @@
 #define PACKET_PAYLOAD_OFFSET 4
 #define PACKET_MIN_SIZE (PACKET_HEADER_SIZE + PACKET_OPCODE_SIZE + PACKET_LENGTH_SIZE + PACKET_CRC_SIZE)
 
-// 指令参数长度常量
-#define ADDR_SIZE_PARAM_LENGTH 8         // uint32_t addr + uint32_t size
-#define ADDR_SIZE_CRC_PARAM_LENGTH 12    // uint32_t addr + uint32_t size + uint32_t crc
+/* 指令参数长度常量 */
+#define ADDR_SIZE_PARAM_LENGTH 8         /* uint32_t addr + uint32_t size */
+#define ADDR_SIZE_CRC_PARAM_LENGTH 12    /* uint32_t addr + uint32_t size + uint32_t crc */
 
 /*
  * 加密固件流式传输相关 payload 长度常量
@@ -420,6 +420,18 @@ static void bl_opcode_fw_write_handler(void)
  * @brief 0x85 FW_COMMIT — 提交固件：解密验证CRC32 → 更新元数据 → 烧录到内部Flash → 复位
  *
  * Payload格式：[nonce(8B)][fw_version(4B)][crc32(4B)] = 16字节
+ *
+ *   nonce (8B)
+ *     AES-128 CTR 模式的初始化向量前半段（Nonce = Number Used Once）。
+ *     上位机在加密固件时随机生成此 8 字节值，并将其与加密后的固件一同管理。
+ *     CTR 计数器块格式为 [nonce(8B)][counter_be(4B)][zeros(4B)]，counter 从 0 开始
+ *     每处理 16 字节递增一次。bootloader 拿到 nonce 后用相同参数对 W25Q128 中存储的
+ *     密文进行解密，从而还原出原始固件内容并进行 CRC32 校验。
+ *     同一份固件每次升级建议使用不同的 nonce，以防重放攻击。
+ *
+ *   fw_version (4B)  固件版本号，uint32_t，写入存储区元数据供后续版本管理使用。
+ *   crc32 (4B)       明文固件的 CRC32 校验值，bootloader 解密后对比此值以验证完整性。
+ *
  * 流程：先完成验证+元数据更新，验证通过后发送ACK，再执行烧录并复位。
  * 上位机收到ACK后等待设备重连即可；若收到ERR_VERIFY则说明固件CRC校验失败。
  */

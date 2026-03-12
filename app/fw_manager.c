@@ -183,7 +183,10 @@ static void write_zone(uint32_t zone_addr, const uint8_t *data, uint32_t size)
  * @param zone_addr      区域起始地址
  * @param size           固件大小
  * @param expected_crc32 期望的明文CRC32
- * @param nonce          AES CTR nonce（8字节）
+ * @param nonce          AES-128 CTR nonce（Number Used Once，8字节）：上位机加密固件时随机生成
+ *                       的初始化向量前半段。计数器块格式 [nonce(8B)][counter_be(4B)][zeros(4B)]，
+ *                       counter 从 0 起每 16 字节递增。由 FW_COMMIT payload 传入，使 bootloader
+ *                       能以与加密时相同的参数逐块解密固件，从而还原明文并计算 CRC32。
  * @return true=验证通过
  */
 static bool verify_zone(uint32_t zone_addr, uint32_t size,
@@ -233,7 +236,10 @@ static bool verify_zone(uint32_t zone_addr, uint32_t size,
  * @brief 从W25Q128分块读取、解密，并写入内部Flash
  * @param zone_addr 区域起始地址（W25Q128）
  * @param size      固件大小
- * @param nonce     AES CTR nonce（8字节）
+ * @param nonce     AES-128 CTR nonce（Number Used Once，8字节）：上位机加密固件时随机生成
+ *                  的初始化向量前半段。计数器块格式 [nonce(8B)][counter_be(4B)][zeros(4B)]，
+ *                  counter 从 0 起每 16 字节递增。由 FW_COMMIT payload 传入，使 bootloader
+ *                  能以与加密时相同的参数逐块解密固件并烧录到内部 Flash。
  * @return true=成功
  */
 static bool decrypt_and_flash(uint32_t zone_addr, uint32_t size,
