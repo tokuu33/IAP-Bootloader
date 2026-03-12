@@ -109,22 +109,22 @@ static void meta_read(fw_meta_t *meta)
 
 /**
  * @brief 将meta结构体写入W25Q128元数据区
- *        写前计算meta_crc32（不含meta_crc32字段本身），先擦除扇区再写入
+ *        写前计算meta_crc32（不含meta_crc32字段本身），先擦除扇区再写入。
+ *        同时更新 meta->meta_crc32，使内存中的结构体与 Flash 保持一致：
+ *        若只更新临时副本而不写回，fw_manager_flash_firmware() 对内存副本调用
+ *        meta_validate() 时会因 CRC 为 0 而失败，导致烧录流程被意外中止。
  */
-static void meta_write(const fw_meta_t *meta)
+static void meta_write(fw_meta_t *meta)
 {
-    fw_meta_t tmp;
-    memcpy(&tmp, meta, sizeof(fw_meta_t));
-
-    /* 计算元数据CRC32（不含meta_crc32字段） */
-    tmp.meta_crc32 = calc_crc32_buf((const uint8_t *)&tmp,
-                                     (uint32_t)((uint8_t *)&tmp.meta_crc32 - (uint8_t *)&tmp));
+    /* 计算并直接写回 CRC32（不使用临时副本，保持内存与 Flash 状态一致） */
+    meta->meta_crc32 = calc_crc32_buf((const uint8_t *)meta,
+                                      (uint32_t)((uint8_t *)&meta->meta_crc32 - (uint8_t *)meta));
 
     /* 擦除元数据扇区（1扇区 = 4KB） */
     w25qxx_erase_sector(FW_META_ADDR);
 
     /* 写入更新后的元数据 */
-    w25qxx_write(FW_META_ADDR, (uint8_t *)&tmp, sizeof(fw_meta_t));
+    w25qxx_write(FW_META_ADDR, (uint8_t *)meta, sizeof(fw_meta_t));
 }
 
 /**
@@ -458,12 +458,20 @@ bool fw_manager_flash_firmware(void)
     bool flash_ok = false;
     uint8_t try_zone; /* 本次尝试的区（0=A，1=B） */
 
-    /* 读取最新元数据 */
-    meta_read(&s_meta);
-    if (!meta_validate(&s_meta))
+    /* 优先使用内存中已验证的元数据（由 fw_manager_init 或 fw_manager_commit_write 维护）。
+     * meta_write() 会同步更新 s_meta.meta_crc32，故 meta_validate(&s_meta) 通常可直接通过。
+     * 只有内存状态无效时才回退到从 W25Q128 重读，避免因 SPI Flash 写入时序问题
+     * 导致重读失败而中断烧录流程。
+     *   - !s_meta_valid：fw_manager_init() 从未被调用（不应发生，但作保底）
+     *   - !meta_validate(&s_meta)：内存中 CRC 字段未正确更新（旧代码路径残留，此修复后应不再出现） */
+    if (!s_meta_valid || !meta_validate(&s_meta))
     {
-        log_e("fw_flash: metadata invalid, cannot flash");
-        return false;
+        meta_read(&s_meta);
+        if (!meta_validate(&s_meta))
+        {
+            log_e("fw_flash: metadata invalid, cannot flash");
+            return false;
+        }
     }
 
     /* 首先尝试active_zone指向的区域；若失败，切换到另一区域 */
