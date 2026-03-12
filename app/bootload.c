@@ -482,6 +482,11 @@ static void bl_opcode_fw_commit_handler(void)
  *
  * Payload：空（长度为0）
  * 调用成功后系统将复位并从备份区固件启动。
+ *
+ * 响应策略：先检查备份区有效性，再决定响应码：
+ *   - 备份区有固件(ZONE_STATE_VALID)：发送 ERR_OK，执行回滚+复位（不会返回）
+ *   - 备份区无有效固件              ：发送 ERR_FAILED，直接返回（不触发复位）
+ * 这样可以确保上位机收到的响应码与实际操作结果一致，避免误导性的 ERR_OK。
  */
 static void bl_opcode_fw_rollback_handler(void)
 {
@@ -494,19 +499,31 @@ static void bl_opcode_fw_rollback_handler(void)
         return;
     }
 
-    /* 先发送ACK */
+    /* 在响应前检查备份区是否有有效固件，避免先发 ERR_OK 后执行失败 */
+    const fw_meta_t *meta = fw_manager_get_meta();
+    uint8_t backup_zone  = (meta->active_zone == 0U) ? 1U : 0U;
+    uint8_t backup_state = (backup_zone == 0U) ? meta->zone_a_state : meta->zone_b_state;
+
+    if (backup_state != (uint8_t)ZONE_STATE_VALID)
+    {
+        log_e("FW_Rollback: no valid firmware in backup zone_%c",
+              (backup_zone == 0U) ? 'A' : 'B');
+        bl_response(PACKET_OPCODE_FW_ROLLBACK, PACKET_ERRCODE_ERR_FAILED, NULL, 0);
+        return;
+    }
+
+    /* 备份区有效 — 先发送 ACK，再执行回滚+复位（复位后不会返回此处） */
     bl_response(PACKET_OPCODE_FW_ROLLBACK, PACKET_ERRCODE_ERR_OK, NULL, 0);
-    tim_delay_ms(5);
+    tim_delay_ms(5); /* 确保 ACK 帧发送完成 */
 
-    log_w("FW_Rollback: requesting rollback to backup zone...");
-    /* 设置回滚标志，然后立即执行回滚（切换激活区 → 烧录 → 复位） */
+    log_w("FW_Rollback: initiating rollback to zone_%c...",
+          (backup_zone == 0U) ? 'A' : 'B');
     fw_manager_request_rollback();
-    fw_manager_check_rollback();
+    fw_manager_check_rollback(); /* 内部调用 NVIC_SystemReset()，正常不会返回 */
 
-    /* check_rollback 若执行回滚会调用 NVIC_SystemReset()，不会返回此处 */
-    /* 若无可用备份区，check_rollback 会直接返回，此时发送失败响应 */
-    log_e("FW_Rollback: no valid backup zone available");
-    bl_response(PACKET_OPCODE_FW_ROLLBACK, PACKET_ERRCODE_ERR_FAILED, NULL, 0);
+    /* Safety fallsafe: if check_rollback unexpectedly returns, force a reset */
+    log_e("FW_Rollback: unexpected return from check_rollback, forcing reset");
+    NVIC_SystemReset();
 }
 
 static void bl_opcode_reset_handler(void)

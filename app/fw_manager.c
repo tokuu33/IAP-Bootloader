@@ -777,16 +777,13 @@ bool fw_manager_commit_write(const uint8_t nonce[8], uint32_t fw_version, uint32
     s_meta.boot_fail_count = 0;
     meta_write(&s_meta);
 
-    log_i("fw_commit: metadata updated, zone_%c is now active",
+    log_i("fw_commit: metadata updated, zone_%c is now active; flashing handled by caller",
           (s_write_zone_idx == 0) ? 'A' : 'B');
 
     /* 清除流式写入状态（防止重复提交） */
     s_write_zone_addr  = 0;
     s_write_zone_idx   = 0;
     s_write_total_size = 0;
-
-    log_i("fw_commit: metadata updated, zone_%c active. Flashing and reset handled by caller.",
-          (s_meta.active_zone == 0) ? 'A' : 'B');
 
     return true; /* 验证和元数据更新成功；调用者负责执行烧录和复位 */
 }
