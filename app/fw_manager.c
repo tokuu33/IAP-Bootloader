@@ -108,11 +108,39 @@ static void meta_read(fw_meta_t *meta)
 }
 
 /**
+ * @brief 验证元数据有效性（检查magic和meta_crc32），失败时输出诊断日志
+ * @return true=元数据有效
+ * @note  此函数须在 meta_write() 之前定义，因为 meta_write 内部调用了它
+ */
+static bool meta_validate(const fw_meta_t *meta)
+{
+    if (meta->magic != FW_META_MAGIC)
+    {
+        log_d("meta_validate: magic mismatch 0x%08lX != 0x%08lX",
+              (unsigned long)meta->magic, (unsigned long)FW_META_MAGIC);
+        return false;
+    }
+
+    /* 计算并比对元数据CRC32 */
+    uint32_t crc = calc_crc32_buf((const uint8_t *)meta,
+                                   (uint32_t)((const uint8_t *)&meta->meta_crc32 - (const uint8_t *)meta));
+    if (crc != meta->meta_crc32)
+    {
+        log_d("meta_validate: CRC mismatch calc=0x%08lX stored=0x%08lX",
+              (unsigned long)crc, (unsigned long)meta->meta_crc32);
+        return false;
+    }
+
+    return true;
+}
+
+/**
  * @brief 将meta结构体写入W25Q128元数据区
- *        写前计算meta_crc32（不含meta_crc32字段本身），先擦除扇区再写入。
- *        同时更新 meta->meta_crc32，使内存中的结构体与 Flash 保持一致：
- *        若只更新临时副本而不写回，fw_manager_flash_firmware() 对内存副本调用
- *        meta_validate() 时会因 CRC 为 0 而失败，导致烧录流程被意外中止。
+ *        先将计算好的 CRC32 写回 meta->meta_crc32（直接修改入参），再擦除扇区并写入。
+ *        直接修改入参而非使用临时副本，可保证内存中的 s_meta 与 Flash 状态始终一致：
+ *        若只写临时副本，fw_manager_flash_firmware() 对内存副本调用 meta_validate() 时
+ *        会因 CRC 为 0 而失败，导致烧录流程被意外中止。
+ *        写入后立即回读校验，若校验失败则输出错误日志（硬件故障检测）。
  */
 static void meta_write(fw_meta_t *meta)
 {
@@ -125,24 +153,24 @@ static void meta_write(fw_meta_t *meta)
 
     /* 写入更新后的元数据 */
     w25qxx_write(FW_META_ADDR, (uint8_t *)meta, sizeof(fw_meta_t));
-}
 
-/**
- * @brief 验证元数据有效性（检查magic和meta_crc32）
- * @return true=元数据有效
- */
-static bool meta_validate(const fw_meta_t *meta)
-{
-    if (meta->magic != FW_META_MAGIC)
-        return false;
-
-    /* 计算并比对元数据CRC32 */
-    uint32_t crc = calc_crc32_buf((const uint8_t *)meta,
-                                   (uint32_t)((const uint8_t *)&meta->meta_crc32 - (const uint8_t *)meta));
-    if (crc != meta->meta_crc32)
-        return false;
-
-    return true;
+    /* 回读校验：确认 W25Q128 写入真正持久化 */
+    fw_meta_t verify_buf;
+    w25qxx_read(FW_META_ADDR, (uint8_t *)&verify_buf, sizeof(fw_meta_t));
+    if (!meta_validate(&verify_buf))
+    {
+        log_e("meta_write: W25Q128 write verify FAILED! "
+              "magic=0x%08lX crc_stored=0x%08lX crc_calc=0x%08lX",
+              (unsigned long)verify_buf.magic,
+              (unsigned long)verify_buf.meta_crc32,
+              (unsigned long)calc_crc32_buf((const uint8_t *)&verify_buf,
+                  (uint32_t)((const uint8_t *)&verify_buf.meta_crc32 - (const uint8_t *)&verify_buf)));
+    }
+    else
+    {
+        log_d("meta_write: W25Q128 write verified OK, crc=0x%08lX",
+              (unsigned long)meta->meta_crc32);
+    }
 }
 
 /* ========================================================================== */
@@ -460,18 +488,23 @@ bool fw_manager_flash_firmware(void)
 
     /* 优先使用内存中已验证的元数据（由 fw_manager_init 或 fw_manager_commit_write 维护）。
      * meta_write() 会同步更新 s_meta.meta_crc32，故 meta_validate(&s_meta) 通常可直接通过。
-     * 只有内存状态无效时才回退到从 W25Q128 重读，避免因 SPI Flash 写入时序问题
-     * 导致重读失败而中断烧录流程。
-     *   - !s_meta_valid：fw_manager_init() 从未被调用（不应发生，但作保底）
-     *   - !meta_validate(&s_meta)：内存中 CRC 字段未正确更新（旧代码路径残留，此修复后应不再出现） */
+     * 只有内存状态无效时才回退到从 W25Q128 重读。
+     *
+     * 重要：回退路径必须使用临时缓冲区读回，不能直接覆盖 s_meta。
+     * 若直接 meta_read(&s_meta) 且读回验证失败，s_meta 中的 zone_a/b_state 已被 W25Q128
+     * 上的脏数据污染（如 zone_a_state=VALID 但 CRC 错误），会导致后续 fw_begin 选区逻辑
+     * 错误地选择 zone_B，进而在下次 OTA 中出现意外行为。 */
     if (!s_meta_valid || !meta_validate(&s_meta))
     {
-        meta_read(&s_meta);
-        if (!meta_validate(&s_meta))
+        fw_meta_t tmp_meta;
+        w25qxx_read(FW_META_ADDR, (uint8_t *)&tmp_meta, sizeof(fw_meta_t));
+        if (!meta_validate(&tmp_meta))
         {
-            log_e("fw_flash: metadata invalid, cannot flash");
+            log_e("fw_flash: metadata invalid in both RAM and Flash, cannot flash");
             return false;
         }
+        /* 读回验证通过，才将新状态同步到 s_meta，避免脏数据污染 */
+        s_meta = tmp_meta;
     }
 
     /* 首先尝试active_zone指向的区域；若失败，切换到另一区域 */
@@ -565,9 +598,18 @@ bool fw_manager_flash_firmware(void)
 
 void fw_manager_check_rollback(void)
 {
-    /* 读取最新元数据 */
-    meta_read(&s_meta);
-    if (!meta_validate(&s_meta))
+    /* 直接使用 fw_manager_init() 已初始化好的 s_meta，不重新从 W25Q128 读取。
+     *
+     * 背景：早期代码此处调用 meta_read(&s_meta) 导致严重的状态污染问题：
+     *   - fw_manager_init() 若 meta_validate 失败，会 memset 清零 s_meta（zone_a_state = EMPTY）
+     *   - 但随后 check_rollback 再次 meta_read，把 W25Q128 上的脏数据（zone_a_state = VALID、
+     *     CRC 错误）重新加载到 s_meta
+     *   - meta_validate 再次失败后 check_rollback 直接 return，但 s_meta 中
+     *     zone_a_state 已被脏数据污染为 VALID
+     *   - 后续 fw_manager_begin_write 读到 zone_a_state = VALID，错误地选择 zone_B
+     * 因此，check_rollback 不得重新加载 Flash，只验证 s_meta 当前状态即可。
+     * 返回 early 可保留 fw_manager_init() 设置的安全默认状态，防止未定义行为。 */
+    if (!s_meta_valid || !meta_validate(&s_meta))
     {
         /* 元数据无效，不进行回滚处理 */
         log_w("fw_mgr: check_rollback: metadata invalid, skip");
