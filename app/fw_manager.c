@@ -79,7 +79,8 @@ static uint32_t s_write_total_size = 0;
 
 static uint32_t calc_crc32_buf(const uint8_t *data, uint32_t len)
 {
-    static const uint32_t crc_table[16] = {
+    static const uint32_t crc_table[16] =
+    {
         0x00000000UL, 0x1DB71064UL, 0x3B6E20C8UL, 0x26D930ACUL,
         0x76DC4190UL, 0x6B6B51F4UL, 0x4DB26158UL, 0x5005713CUL,
         0xEDB88320UL, 0xF00F9344UL, 0xD6D6A3E8UL, 0xCB61B38CUL,
@@ -136,6 +137,9 @@ static void meta_write(fw_meta_t *meta)
                                       (uint32_t)((uint8_t *)&meta->meta_crc32 - (uint8_t *)meta));
     w25qxx_erase_sector(FW_META_ADDR);
     w25qxx_write(FW_META_ADDR, (uint8_t *)meta, sizeof(fw_meta_t));
+
+    /* 元数据写入后认为 RAM 元数据有效 */
+    s_meta_valid = 1;
 
     /* 新增：回读校验，确认 W25Q128 写入真正持久化 */
     fw_meta_t verify_buf;
@@ -206,7 +210,8 @@ static bool verify_zone(uint32_t zone_addr, uint32_t size,
     uint32_t crc_accum  = 0xFFFFFFFFUL;
 
     /* 复用4位nibble查找表进行流式CRC32计算 */
-    static const uint32_t crc_table[16] = {
+    static const uint32_t crc_table[16] =
+    {
         0x00000000UL, 0x1DB71064UL, 0x3B6E20C8UL, 0x26D930ACUL,
         0x76DC4190UL, 0x6B6B51F4UL, 0x4DB26158UL, 0x5005713CUL,
         0xEDB88320UL, 0xF00F9344UL, 0xD6D6A3E8UL, 0xCB61B38CUL,
@@ -470,6 +475,19 @@ bool fw_manager_flash_firmware(void)
         }
         /* 只有验证通过才同步到 s_meta，避免脏数据污染 */
         s_meta = tmp_meta;
+    }
+    /* 优先信任刚写入 RAM 的元数据；只有在 RAM 无效时才从 Flash 补救 */
+    if (!s_meta_valid || !meta_validate(&s_meta))
+    {
+        log_w("fw_flash: RAM metadata invalid, try reading from W25Q128...");
+        fw_meta_t tmp_meta;
+        w25qxx_read(FW_META_ADDR, (uint8_t *)&tmp_meta, sizeof(fw_meta_t));
+        if (!meta_validate(&tmp_meta)) {
+            log_e("fw_flash: metadata invalid in both RAM and Flash, cannot flash");
+            return false;
+        }
+        s_meta = tmp_meta;
+        s_meta_valid = 1;
     }
 
     /* 首先尝试active_zone指向的区域；若失败，切换到另一区域 */
